@@ -1,0 +1,826 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Module B (Automation) - WorldSkills Cloud Computing simulation (Korea 2021, Task 2).
+  VPC with public and private subnets, bastion, API instances behind an ALB and CI/CD with
+  CodeCommit, CodeBuild, CodeDeploy, CodePipeline and ECR. The private subnets reach AWS
+  through VPC endpoints and the instances are managed through SSM (no key pairs).
+
+Parameters:
+  Al2AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+    Description: Amazon Linux 2 - API instances and the private EC2
+  Al2023AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Amazon Linux 2023 - bastion
+  PrivateANat:
+    Type: String
+    AllowedValues: ['false', 'true']
+    Default: 'false'
+    Description: >-
+      'false' = wsi-private-a is fully private (no route to the internet).
+      'true' = original task: wsi-private-a goes to the internet through NAT gateway A.
+  BastionKeyName:
+    Type: String
+    Default: ''
+    Description: Optional EC2 key pair for SSH to the bastion (empty = access only through SSM)
+  BastionSshCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: Source allowed to SSH to the bastion
+  S3PrefixListId:
+    Type: String
+    Default: pl-63a5400a
+    Description: AWS managed prefix list of Amazon S3 in the region (pl-63a5400a = us-east-1)
+  LaunchScriptUrl:
+    Type: String
+    Default: https://raw.githubusercontent.com/pablinrlq/wsi-module-b-automation/main/bastion/ec2_launch.sh
+    Description: The bastion downloads /opt/ec2_launch.sh from this URL
+
+Conditions:
+  PrivateAHasNat: !Equals [!Ref PrivateANat, 'true']
+  HasBastionKey: !Not [!Equals [!Ref BastionKeyName, '']]
+
+Resources:
+  # ------------------------------------------------------------------ network
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.1.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{Key: Name, Value: wsi-vpc}]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{Key: Name, Value: wsi-igw}]
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.1.2.0/24
+      AvailabilityZone: !Sub ${AWS::Region}a
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: wsi-public-a}]
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.1.3.0/24
+      AvailabilityZone: !Sub ${AWS::Region}b
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: wsi-public-b}]
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.1.0.0/24
+      AvailabilityZone: !Sub ${AWS::Region}a
+      Tags: [{Key: Name, Value: wsi-private-a}]
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.1.1.0/24
+      AvailabilityZone: !Sub ${AWS::Region}b
+      Tags: [{Key: Name, Value: wsi-private-b}]
+  # Subnet of the standalone private EC2: its route table has only the local route
+  PrivateEc2Subnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.1.4.0/24
+      AvailabilityZone: !Sub ${AWS::Region}a
+      Tags: [{Key: Name, Value: wsi-private-ec2}]
+
+  NatEipA:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags: [{Key: Name, Value: wsi-nat-a}]
+  NatEipB:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags: [{Key: Name, Value: wsi-nat-b}]
+  NatGatewayA:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      AllocationId: !GetAtt NatEipA.AllocationId
+      Tags: [{Key: Name, Value: wsi-nat-a}]
+  NatGatewayB:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      AllocationId: !GetAtt NatEipB.AllocationId
+      Tags: [{Key: Name, Value: wsi-nat-b}]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{Key: Name, Value: wsi-public-rt}]
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicSubnetARouteTable:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+  PublicSubnetBRouteTable:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTableA:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{Key: Name, Value: wsi-private-a-rt}]
+  PrivateADefaultRoute:
+    Type: AWS::EC2::Route
+    Condition: PrivateAHasNat
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableA
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayA
+  PrivateSubnetARouteTable:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTableA
+
+  PrivateRouteTableB:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{Key: Name, Value: wsi-private-b-rt}]
+  PrivateBDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableB
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayB
+  PrivateSubnetBRouteTable:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTableB
+
+  PrivateEc2RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{Key: Name, Value: wsi-private-ec2-rt}]
+  PrivateEc2SubnetRouteTable:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateEc2Subnet
+      RouteTableId: !Ref PrivateEc2RouteTable
+
+  # ------------------------------------------------------------------ security groups
+  # (rules that point at each other are separate resources, to avoid circular references)
+  VpceSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: wsi-vpce-sg
+      GroupDescription: VPC endpoints - HTTPS from wsi-vpc
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 10.1.0.0/16, Description: HTTPS from wsi-vpc}
+      # endpoints never open connections: replace the default allow-all egress with a rule that matches nothing
+      SecurityGroupEgress:
+        - {IpProtocol: icmp, FromPort: 252, ToPort: 86, CidrIp: 127.0.0.1/32, Description: no egress}
+      Tags: [{Key: Name, Value: wsi-vpce-sg}]
+
+  ApiSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: wsi-api-sg
+      GroupDescription: wsi-api instances
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - {IpProtocol: tcp, FromPort: 443, ToPort: 443, DestinationSecurityGroupId: !Ref VpceSg, Description: SSM and CodeDeploy VPC endpoints}
+        - {IpProtocol: tcp, FromPort: 443, ToPort: 443, DestinationPrefixListId: !Ref S3PrefixListId, Description: S3 gateway endpoint}
+      Tags: [{Key: Name, Value: wsi-api-sg}]
+
+  AlbSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: wsi-alb-sg
+      GroupDescription: wsi-api-alb
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0, Description: public HTTP}
+      SecurityGroupEgress:
+        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, DestinationSecurityGroupId: !Ref ApiSg, Description: API instances}
+      Tags: [{Key: Name, Value: wsi-alb-sg}]
+
+  BastionSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: wsi-bastion-sg
+      GroupDescription: wsi-bastion (grading host)
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 22, ToPort: 22, CidrIp: !Ref BastionSshCidr, Description: SSH}
+      SecurityGroupEgress:
+        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0, Description: 'HTTP - packages and ALB'}
+        - {IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: 'HTTPS - AWS APIs and ECR and packages'}
+        - {IpProtocol: tcp, FromPort: 22, ToPort: 22, DestinationSecurityGroupId: !Ref ApiSg, Description: SSH to the API instances}
+      Tags: [{Key: Name, Value: wsi-bastion-sg}]
+
+  ApiSgHttpFromAlb:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ApiSg
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      SourceSecurityGroupId: !Ref AlbSg
+      Description: ALB
+  ApiSgHttpFromBastion:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ApiSg
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      SourceSecurityGroupId: !Ref BastionSg
+      Description: bastion (grading)
+  ApiSgSshFromBastion:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ApiSg
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      SourceSecurityGroupId: !Ref BastionSg
+      Description: bastion SSH
+
+  PrivateEc2Sg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: wsi-private-ec2-sg
+      GroupDescription: Private EC2 - only HTTPS to the SSM endpoints
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - {IpProtocol: tcp, FromPort: 443, ToPort: 443, DestinationSecurityGroupId: !Ref VpceSg, Description: SSM VPC endpoints}
+      Tags: [{Key: Name, Value: wsi-private-ec2-sg}]
+
+  # ------------------------------------------------------------------ VPC endpoints
+  # Interface endpoints with private DNS: inside the VPC the normal service names resolve to them
+  SsmEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssm
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref VpceSg]
+  SsmMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssmmessages
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref VpceSg]
+  Ec2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ec2messages
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref VpceSg]
+  CodeDeployEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.codedeploy
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref VpceSg]
+  # The CodeDeploy agent uses this one when :enable_auth_policy: is true
+  CodeDeployCommandsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.codedeploy-commands-secure
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref VpceSg]
+  # Gateway endpoint: a route to the S3 prefix list in wsi-private-a-rt
+  # (yum repos, CodeDeploy agent installer, pipeline artifacts)
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref PrivateRouteTableA]
+
+  # ------------------------------------------------------------------ IAM
+  ApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: wsi-api
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - {Effect: Allow, Principal: {Service: ec2.amazonaws.com}, Action: sts:AssumeRole}
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonEC2RoleforAWSCodeDeploy
+      Policies:
+        - PolicyName: wsi-api-codedeploy-vpce
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codedeploy-commands-secure:GetDeploymentSpecification
+                  - codedeploy-commands-secure:PollHostCommand
+                  - codedeploy-commands-secure:PutHostCommandAcknowledgement
+                  - codedeploy-commands-secure:PutHostCommandComplete
+                Resource: '*'
+  ApiInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: wsi-api
+      Roles: [!Ref ApiRole]
+
+  BastionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: wsi-bastion
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - {Effect: Allow, Principal: {Service: ec2.amazonaws.com}, Action: sts:AssumeRole}
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AdministratorAccess
+  BastionInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: wsi-bastion
+      Roles: [!Ref BastionRole]
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: wsi-codebuild-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - {Effect: Allow, Principal: {Service: codebuild.amazonaws.com}, Action: sts:AssumeRole}
+      Policies:
+        - PolicyName: wsi-codebuild-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource:
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/wsi-api-*
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/wsi-api-*:*
+              - Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion, s3:PutObject, s3:GetBucketAcl, s3:GetBucketLocation, s3:ListBucket]
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub ${ArtifactBucket.Arn}/*
+              - Effect: Allow
+                Action: codecommit:GitPull
+                Resource: !GetAtt CodeRepo.Arn
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                  - ecr:DescribeImages
+                Resource: !GetAtt EcrRepo.Arn
+
+  CodeDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: wsi-codedeploy-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - {Effect: Allow, Principal: {Service: codedeploy.amazonaws.com}, Action: sts:AssumeRole}
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSCodeDeployRole
+
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: wsi-codepipeline-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - {Effect: Allow, Principal: {Service: codepipeline.amazonaws.com}, Action: sts:AssumeRole}
+      Policies:
+        - PolicyName: wsi-codepipeline-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codecommit:GetBranch
+                  - codecommit:GetCommit
+                  - codecommit:GetRepository
+                  - codecommit:UploadArchive
+                  - codecommit:GetUploadArchiveStatus
+                  - codecommit:CancelUploadArchive
+                Resource: !GetAtt CodeRepo.Arn
+              - Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion, s3:PutObject, s3:GetBucketVersioning, s3:GetBucketAcl, s3:GetBucketLocation, s3:ListBucket]
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub ${ArtifactBucket.Arn}/*
+              - Effect: Allow
+                Action: [codebuild:StartBuild, codebuild:BatchGetBuilds]
+                Resource: !GetAtt BuildProject.Arn
+              - Effect: Allow
+                Action:
+                  - codedeploy:CreateDeployment
+                  - codedeploy:GetDeployment
+                  - codedeploy:GetApplication
+                  - codedeploy:GetApplicationRevision
+                  - codedeploy:RegisterApplicationRevision
+                  - codedeploy:GetDeploymentConfig
+                Resource: '*'
+
+  EventsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: wsi-events-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - {Effect: Allow, Principal: {Service: events.amazonaws.com}, Action: sts:AssumeRole}
+      Policies:
+        - PolicyName: wsi-events-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: codepipeline:StartPipelineExecution
+                Resource: !Sub arn:${AWS::Partition}:codepipeline:${AWS::Region}:${AWS::AccountId}:${Pipeline}
+              - Effect: Allow
+                Action: codebuild:StartBuild
+                Resource: !GetAtt ReleaseProject.Arn
+
+  # ------------------------------------------------------------------ EC2
+  # Bastion = grading host: docker, git, jq, AWS CLI v2 (AL2023) and /opt/ec2_launch.sh
+  Bastion:
+    Type: AWS::EC2::Instance
+    DependsOn: PublicDefaultRoute
+    Properties:
+      ImageId: !Ref Al2023AmiId
+      InstanceType: t3.small
+      SubnetId: !Ref PublicSubnetA
+      SecurityGroupIds: [!Ref BastionSg]
+      IamInstanceProfile: !Ref BastionInstanceProfile
+      KeyName: !If [HasBastionKey, !Ref BastionKeyName, !Ref AWS::NoValue]
+      Tags: [{Key: Name, Value: wsi-bastion}]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          for i in $(seq 1 30); do dnf install -y docker git jq && break; sleep 10; done
+          systemctl enable --now docker
+          usermod -aG docker ec2-user
+          mkdir -p /root/.aws /home/ec2-user/.aws
+          printf "[default]\nregion = ${AWS::Region}\noutput = json\n" > /root/.aws/config
+          cp /root/.aws/config /home/ec2-user/.aws/config
+          chown -R ec2-user:ec2-user /home/ec2-user/.aws
+          echo 'export AWS_DEFAULT_REGION=${AWS::Region}' > /etc/profile.d/aws-region.sh
+          git config --system credential.helper '!aws codecommit credential-helper $@'
+          git config --system credential.UseHttpPath true
+          for i in $(seq 1 30); do curl -fsSL -o /opt/ec2_launch.sh ${LaunchScriptUrl} && break; sleep 10; done
+          chmod 755 /opt/ec2_launch.sh
+
+  # Shared by wsi-api-1 / wsi-api-2. No key pair (SSM only). The bootstrap works without
+  # internet: repos and installer through the S3 endpoint, CodeDeploy through its VPC endpoint.
+  ApiLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: wsi-api-lt
+      LaunchTemplateData:
+        ImageId: !Ref Al2AmiId
+        InstanceType: t3.small
+        IamInstanceProfile: {Arn: !GetAtt ApiInstanceProfile.Arn}
+        SecurityGroupIds: [!Ref ApiSg]
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            if ! rpm -q amazon-ssm-agent >/dev/null 2>&1; then
+              for i in $(seq 1 30); do yum install -y https://s3.${AWS::Region}.amazonaws.com/amazon-ssm-${AWS::Region}/latest/linux_amd64/amazon-ssm-agent.rpm && break; sleep 10; done
+            fi
+            systemctl enable --now amazon-ssm-agent
+            if ! rpm -q codedeploy-agent >/dev/null 2>&1; then
+              for i in $(seq 1 30); do yum install -y ruby && break; sleep 10; done
+              cd /tmp
+              for i in $(seq 1 30); do curl -fsSL -o install https://aws-codedeploy-${AWS::Region}.s3.${AWS::Region}.amazonaws.com/latest/install && break; sleep 10; done
+              chmod +x ./install && ./install auto
+            fi
+            # use codedeploy-commands-secure (the CodeDeploy endpoint that exists in the VPC)
+            conf=/etc/codedeploy-agent/conf/codedeployagent.yml
+            if grep -q '^:enable_auth_policy:' $conf; then
+              sed -i 's/^:enable_auth_policy:.*/:enable_auth_policy: true/' $conf
+            else
+              echo ':enable_auth_policy: true' >> $conf
+            fi
+            systemctl enable codedeploy-agent
+            systemctl kill -s SIGKILL codedeploy-agent 2>/dev/null
+            systemctl restart codedeploy-agent
+
+  ApiInstance1:
+    Type: AWS::EC2::Instance
+    DependsOn: [S3GatewayEndpoint, SsmEndpoint, SsmMessagesEndpoint, Ec2MessagesEndpoint, CodeDeployEndpoint, CodeDeployCommandsEndpoint]
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ApiLaunchTemplate
+        Version: !GetAtt ApiLaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref PrivateSubnetA
+      Tags:
+        - {Key: Name, Value: wsi-api-1}
+        - {Key: 'wsi:deploy:group', Value: dev-api}
+  ApiInstance2:
+    Type: AWS::EC2::Instance
+    DependsOn: [PrivateBDefaultRoute, SsmEndpoint, SsmMessagesEndpoint, Ec2MessagesEndpoint, CodeDeployEndpoint, CodeDeployCommandsEndpoint]
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ApiLaunchTemplate
+        Version: !GetAtt ApiLaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref PrivateSubnetB
+      Tags:
+        - {Key: Name, Value: wsi-api-2}
+        - {Key: 'wsi:deploy:group', Value: dev-api}
+
+  # Standalone private EC2: nothing installed, no key, no public IP, route table with only the
+  # local route; it is reached only through Session Manager (SSM endpoints)
+  PrivateEc2:
+    Type: AWS::EC2::Instance
+    DependsOn: [SsmEndpoint, SsmMessagesEndpoint, Ec2MessagesEndpoint, PrivateEc2SubnetRouteTable]
+    Properties:
+      ImageId: !Ref Al2AmiId
+      InstanceType: t3.micro
+      SubnetId: !Ref PrivateEc2Subnet
+      SecurityGroupIds: [!Ref PrivateEc2Sg]
+      IamInstanceProfile: !Ref ApiInstanceProfile
+      Tags: [{Key: Name, Value: wsi-private-ec2}]
+
+  # ------------------------------------------------------------------ load balancer
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Name: wsi-api-alb
+      Type: application
+      Scheme: internet-facing
+      Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      SecurityGroups: [!Ref AlbSg]
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: wsi-api-tg
+      VpcId: !Ref Vpc
+      Protocol: HTTP
+      Port: 80
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 10
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Matcher: {HttpCode: '200'}
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - {Type: forward, TargetGroupArn: !Ref TargetGroup}
+
+  # ------------------------------------------------------------------ CI/CD
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub wsi-api-artifacts-${AWS::AccountId}
+      VersioningConfiguration: {Status: Enabled}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  EcrRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: wsi-api-ecr
+      ImageTagMutability: MUTABLE
+      ImageScanningConfiguration: {ScanOnPush: true}
+      EmptyOnDelete: true
+
+  CodeRepo:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: wsi-api-repo
+      RepositoryDescription: WSI API source (Task 2 Automation)
+
+  BuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/codebuild/wsi-api-build
+      RetentionInDays: 30
+  ReleaseLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/codebuild/wsi-api-release
+      RetentionInDays: 30
+
+  # main: app.py -> app.pyc + Flask (vendor/) -> deployment bundle for CodeDeploy
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: wsi-api-build
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Source: {Type: CODEPIPELINE, BuildSpec: buildspec.yml}
+      Artifacts: {Type: CODEPIPELINE}
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:4.0
+      LogsConfig:
+        CloudWatchLogs: {Status: ENABLED, GroupName: !Ref BuildLogGroup}
+      TimeoutInMinutes: 15
+
+  # release: app.pyc -> Docker image -> ECR wsi-api-ecr:<YYMMDDhhmmss>
+  ReleaseProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: wsi-api-release
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Source:
+        Type: CODECOMMIT
+        Location: !GetAtt CodeRepo.CloneUrlHttp
+        BuildSpec: buildspec-release.yml
+        GitCloneDepth: 1
+      SourceVersion: refs/heads/release
+      Artifacts: {Type: NO_ARTIFACTS}
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        PrivilegedMode: true
+      LogsConfig:
+        CloudWatchLogs: {Status: ENABLED, GroupName: !Ref ReleaseLogGroup}
+      TimeoutInMinutes: 15
+
+  DeployApplication:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: wsi-api
+      ComputePlatform: Server
+  DeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref DeployApplication
+      DeploymentGroupName: dev-api
+      ServiceRoleArn: !GetAtt CodeDeployRole.Arn
+      DeploymentConfigName: CodeDeployDefault.AllAtOnce
+      DeploymentStyle: {DeploymentType: IN_PLACE, DeploymentOption: WITH_TRAFFIC_CONTROL}
+      Ec2TagFilters:
+        - {Key: 'wsi:deploy:group', Value: dev-api, Type: KEY_AND_VALUE}
+      LoadBalancerInfo:
+        TargetGroupInfoList:
+          - Name: !GetAtt TargetGroup.TargetGroupName
+      OutdatedInstancesStrategy: UPDATE
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: wsi-api-pipeline
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      PipelineType: V2
+      ExecutionMode: QUEUED
+      ArtifactStore: {Type: S3, Location: !Ref ArtifactBucket}
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId: {Category: Source, Owner: AWS, Provider: CodeCommit, Version: '1'}
+              Configuration:
+                RepositoryName: !GetAtt CodeRepo.Name
+                BranchName: main
+                PollForSourceChanges: false
+                OutputArtifactFormat: CODE_ZIP
+              OutputArtifacts: [{Name: SourceArtifact}]
+              RunOrder: 1
+        - Name: Build
+          Actions:
+            - Name: Build
+              ActionTypeId: {Category: Build, Owner: AWS, Provider: CodeBuild, Version: '1'}
+              Configuration: {ProjectName: !Ref BuildProject}
+              InputArtifacts: [{Name: SourceArtifact}]
+              OutputArtifacts: [{Name: BuildArtifact}]
+              RunOrder: 1
+        - Name: Deploy
+          Actions:
+            - Name: Deploy
+              ActionTypeId: {Category: Deploy, Owner: AWS, Provider: CodeDeploy, Version: '1'}
+              Configuration:
+                ApplicationName: !Ref DeployApplication
+                DeploymentGroupName: !Ref DeploymentGroup
+              InputArtifacts: [{Name: BuildArtifact}]
+              RunOrder: 1
+
+  # main changed -> pipeline; release changed -> CodeBuild wsi-api-release
+  PipelineTriggerRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: wsi-api-pipeline-trigger
+      Description: main branch of wsi-api-repo changed -> start wsi-api-pipeline
+      EventPattern:
+        source: [aws.codecommit]
+        detail-type: [CodeCommit Repository State Change]
+        resources: [!GetAtt CodeRepo.Arn]
+        detail:
+          event: [referenceCreated, referenceUpdated]
+          referenceType: [branch]
+          referenceName: [main]
+      Targets:
+        - Id: wsi-api-pipeline
+          Arn: !Sub arn:${AWS::Partition}:codepipeline:${AWS::Region}:${AWS::AccountId}:${Pipeline}
+          RoleArn: !GetAtt EventsRole.Arn
+  ReleaseTriggerRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: wsi-api-release-trigger
+      Description: release branch of wsi-api-repo changed -> start CodeBuild wsi-api-release
+      EventPattern:
+        source: [aws.codecommit]
+        detail-type: [CodeCommit Repository State Change]
+        resources: [!GetAtt CodeRepo.Arn]
+        detail:
+          event: [referenceCreated, referenceUpdated]
+          referenceType: [branch]
+          referenceName: [release]
+      Targets:
+        - Id: wsi-api-release
+          Arn: !GetAtt ReleaseProject.Arn
+          RoleArn: !GetAtt EventsRole.Arn
+          InputTransformer:
+            InputPathsMap: {commit: $.detail.commitId}
+            InputTemplate: '{"sourceVersion": <commit>}'
+
+Outputs:
+  AlbHealthUrl:
+    Description: Application behind the ALB
+    Value: !Sub http://${Alb.DNSName}/health
+  BastionPublicIp:
+    Value: !GetAtt Bastion.PublicIp
+  CodeCommitCloneUrl:
+    Value: !GetAtt CodeRepo.CloneUrlHttp
+  PrivateEc2Session:
+    Description: Session Manager to the private EC2
+    Value: !Sub aws ssm start-session --target ${PrivateEc2} --region ${AWS::Region}
+  BastionSession:
+    Description: Session Manager to the bastion
+    Value: !Sub aws ssm start-session --target ${Bastion} --region ${AWS::Region}

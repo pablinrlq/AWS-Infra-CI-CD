@@ -1,0 +1,27 @@
+version: 0.2
+
+# CodeBuild project: wsi-api-release (release branch -> Docker image -> ECR wsi-api-ecr)
+env:
+  variables:
+    ECR_REPO: wsi-api-ecr
+
+phases:
+  pre_build:
+    commands:
+      - ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+      - REGISTRY=$ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+      # Image tag = build date/time in KST (UTC+9), format YYMMDDhhmmss (generated when the build runs)
+      # "KST-9" is a POSIX TZ string (= UTC+9, Korea has no DST), so it does not depend on tzdata
+      - IMAGE_TAG=$(TZ=KST-9 date +%y%m%d%H%M%S)
+      - echo "Image $REGISTRY/$ECR_REPO:$IMAGE_TAG"
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $REGISTRY
+  build:
+    commands:
+      # Compile app.py -> app.pyc
+      - mkdir -p build
+      - python3 -c "import py_compile; py_compile.compile('src/app.py', cfile='build/app.pyc', doraise=True)"
+      # The image uses the same Python minor version that compiled app.pyc
+      - PY_VERSION=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')
+      - echo "Compiled with Python $PY_VERSION"
+      - docker build --build-arg PY_VERSION=$PY_VERSION -t $REGISTRY/$ECR_REPO:$IMAGE_TAG .
+      - docker push $REGISTRY/$ECR_REPO:$IMAGE_TAG

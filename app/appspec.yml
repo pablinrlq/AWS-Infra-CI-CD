@@ -1,0 +1,33 @@
+version: 0.0
+os: linux
+
+# The compiled application (app.pyc) and its Python libraries (vendor/: Flask, built by
+# CodeBuild) are deployed to the servers - nothing is downloaded from the internet.
+files:
+  - source: app.pyc
+    destination: /opt/wsi-api
+  - source: vendor
+    destination: /opt/wsi-api/vendor
+file_exists_behavior: OVERWRITE
+
+hooks:
+  # Stop the running process (runs the script from the previous revision)
+  ApplicationStop:
+    - location: scripts/stop_server.sh
+      timeout: 60
+      runas: root
+  # Fresh instance: install python3 and create the systemd service (Flask comes in vendor/)
+  BeforeInstall:
+    - location: scripts/install_dependencies.sh
+      timeout: 600
+      runas: root
+  # Start the process (python3 /opt/wsi-api/app.pyc)
+  ApplicationStart:
+    - location: scripts/start_server.sh
+      timeout: 120
+      runas: root
+  # Make sure GET /health answers 200 before the instance is put back in the ALB target group
+  ValidateService:
+    - location: scripts/validate_service.sh
+      timeout: 120
+      runas: root

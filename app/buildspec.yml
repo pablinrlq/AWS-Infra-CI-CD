@@ -1,0 +1,26 @@
+version: 0.2
+
+# CodeBuild project: wsi-api-build (main branch -> CodePipeline -> CodeDeploy wsi-api/dev-api)
+# app.py is compiled with the Amazon Linux 2 system python3, the same interpreter
+# the wsi-api EC2 instances use, so app.pyc runs there.
+# Flask is downloaded here (CodeBuild has internet access) and shipped inside the artifact
+# (vendor/): the instances are in a private subnet with no NAT and cannot reach PyPI.
+phases:
+  install:
+    commands:
+      - yum install -y python3 python3-pip
+      - /usr/bin/python3 --version
+  build:
+    commands:
+      - mkdir -p build
+      - /usr/bin/python3 -c "import py_compile; py_compile.compile('src/app.py', cfile='build/app.pyc', doraise=True)"
+      - /usr/bin/python3 -m pip install --no-cache-dir --target build/vendor flask
+      - cp appspec.yml build/
+      - cp -r scripts build/
+      - chmod +x build/scripts/*.sh
+      - ls -l build build/scripts build/vendor
+
+artifacts:
+  base-directory: build
+  files:
+    - '**/*'
