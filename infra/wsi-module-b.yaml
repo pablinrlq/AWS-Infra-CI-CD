@@ -33,10 +33,6 @@ Parameters:
     Type: String
     Default: pl-63a5400a
     Description: AWS managed prefix list of Amazon S3 in the region (pl-63a5400a = us-east-1)
-  LaunchScriptUrl:
-    Type: String
-    Default: https://raw.githubusercontent.com/pablinrlq/wsi-module-b-automation/main/bastion/ec2_launch.sh
-    Description: The bastion downloads /opt/ec2_launch.sh from this URL
 
 Conditions:
   PrivateAHasNat: !Equals [!Ref PrivateANat, 'true']
@@ -237,7 +233,7 @@ Resources:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupName: wsi-bastion-sg
-      GroupDescription: wsi-bastion (grading host)
+      GroupDescription: wsi-bastion
       VpcId: !Ref Vpc
       SecurityGroupIngress:
         - {IpProtocol: tcp, FromPort: 22, ToPort: 22, CidrIp: !Ref BastionSshCidr, Description: SSH}
@@ -264,7 +260,7 @@ Resources:
       FromPort: 80
       ToPort: 80
       SourceSecurityGroupId: !Ref BastionSg
-      Description: bastion (grading)
+      Description: bastion
   ApiSgSshFromBastion:
     Type: AWS::EC2::SecurityGroupIngress
     Properties:
@@ -502,7 +498,7 @@ Resources:
                 Resource: !GetAtt ReleaseProject.Arn
 
   # ------------------------------------------------------------------ EC2
-  # Bastion = grading host: docker, git, jq, AWS CLI v2 (AL2023) and /opt/ec2_launch.sh
+  # Bastion: docker, git, jq and AWS CLI v2 (AL2023)
   Bastion:
     Type: AWS::EC2::Instance
     DependsOn: PublicDefaultRoute
@@ -527,8 +523,6 @@ Resources:
           echo 'export AWS_DEFAULT_REGION=${AWS::Region}' > /etc/profile.d/aws-region.sh
           git config --system credential.helper '!aws codecommit credential-helper $@'
           git config --system credential.UseHttpPath true
-          for i in $(seq 1 30); do curl -fsSL -o /opt/ec2_launch.sh ${LaunchScriptUrl} && break; sleep 10; done
-          chmod 755 /opt/ec2_launch.sh
 
   # Shared by wsi-api-1 / wsi-api-2. No key pair (SSM only). The bootstrap works without
   # internet: repos and installer through the S3 endpoint, CodeDeploy through its VPC endpoint.

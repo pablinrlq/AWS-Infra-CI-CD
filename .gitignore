@@ -1,8 +1,5 @@
 *.pem
 *.key
 .aws/
-grade_*.csv
-grade_*.log
-grade_*_commands.txt
 .DS_Store
 Thumbs.db

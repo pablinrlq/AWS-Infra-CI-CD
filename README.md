@@ -45,7 +45,7 @@ flowchart LR
 | NAT gateways | `wsi-nat-a`, `wsi-nat-b` | um em cada subnet pública |
 | VPC endpoints (interface) | ssm, ssmmessages, ec2messages, codedeploy, codedeploy-commands-secure | private DNS, nas duas subnets privadas, SG `wsi-vpce-sg` |
 | VPC endpoint (gateway) | s3 | na `wsi-private-a-rt` (yum, instalador do agente do CodeDeploy, artefatos) |
-| EC2 | `wsi-bastion` | AL2023, t3.small, `wsi-public-a`: host de correção (docker, git, jq, `/opt/ec2_launch.sh`) |
+| EC2 | `wsi-bastion` | AL2023, t3.small, `wsi-public-a` (docker, git, jq) |
 | EC2 | `wsi-api-1`, `wsi-api-2` | AL2, t3.small, tag `wsi:deploy:group=dev-api`, role `wsi-api`, sem key pair |
 | EC2 | `wsi-private-ec2` | AL2, t3.micro, sem nada instalado; só SSM |
 | ALB | `wsi-api-alb` → `wsi-api-tg` | HTTP 80, health check `GET /health` |
@@ -67,8 +67,6 @@ flowchart LR
 ```
 infra/wsi-module-b.yaml   template CloudFormation com toda a infra
 app/                      conteúdo do CodeCommit wsi-api-repo (app, buildspecs, appspec, hooks)
-bastion/ec2_launch.sh     /opt/ec2_launch.sh: cria uma instância nova sem key pair, acesso só por SSM
-grading/grade_B.sh        script de correção do módulo B (B7.6 roda os comandos por SSM)
 ```
 
 ## Como subir (pelo cmd)
@@ -103,19 +101,15 @@ Pré-requisitos: AWS CLI v2 configurado (`aws configure`), git e o [Session Mana
 
    A saída `AlbHealthUrl` deve responder `{"status":"ok"}`. As saídas `PrivateEc2Session` e `BastionSession` têm o comando `aws ssm start-session` de cada instância.
 
-4. Correção: no bastion, rode `sudo bash grade_B.sh`. O script cria uma instância com `/opt/ec2_launch.sh` e faz commits no `wsi-api-repo`.
-
 ## O que mudou em relação ao enunciado
 
-- **Sem key pair:** o `/opt/ec2_launch.sh` cria instâncias sem key pair e sem IP público. Para entrar, use `aws ssm start-session --target <id>` com a conta do AWS CLI. O bootstrap configura o agente do CodeDeploy com `:enable_auth_policy: true`, para ele usar o endpoint `codedeploy-commands-secure`.
+- **Sem key pair:** as instâncias da API e a EC2 privada não têm key pair nem IP público. Para entrar, use `aws ssm start-session --target <id>` com a conta do AWS CLI. O bootstrap configura o agente do CodeDeploy com `:enable_auth_policy: true`, para ele usar o endpoint `codedeploy-commands-secure`.
 - **`wsi-private-a` sem NAT:** a subnet não tem rota para a internet. SSM e CodeDeploy usam VPC endpoints de interface, e o S3 usa o endpoint gateway da route table.
 - **Flask no artefato:** as instâncias não alcançam o PyPI, então o CodeBuild baixa o Flask para `vendor/`, o `appspec.yml` copia para `/opt/wsi-api/vendor` e o serviço roda com `PYTHONPATH=/opt/wsi-api/vendor`.
 - **Regras exatas:** os security groups do caminho privado não usam `0.0.0.0/0` nem `All`.
 - **EC2 privada:** a `wsi-private-ec2` fica em uma subnet própria, com route table só com a rota local e sem nada instalado. O acesso é só por Session Manager.
-- **Correção:** o `grade_B.sh` roda o B7.6 por SSM Run Command quando a instância está Online no SSM (variável `REMOTE_MODE`).
 
 Observações:
 
-- Com `PrivateANat=false`, o B1.6 do `grade_B.sh` falha, porque a `wsi-private-a-rt` não tem NAT. Isso é intencional.
 - O SG default da VPC fica com as regras padrão: o CloudFormation não altera esse SG.
 - O `S3PrefixListId` padrão (`pl-63a5400a`) é o do S3 em `us-east-1`.
