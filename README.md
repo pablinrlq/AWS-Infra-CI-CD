@@ -1,4 +1,4 @@
-# wsi-module-b-automation
+# Exemplo CI/CD
 
 Infraestrutura do **Módulo B (Automation)** do simulado de Cloud Computing (WorldSkills, Korea 2021 – Task 2) na AWS, região `us-east-1`, em **CloudFormation**.
 
@@ -119,13 +119,3 @@ Observações:
 - Com `PrivateANat=false`, o B1.6 do `grade_B.sh` falha, porque a `wsi-private-a-rt` não tem NAT. Isso é intencional.
 - O SG default da VPC fica com as regras padrão: o CloudFormation não altera esse SG.
 - O `S3PrefixListId` padrão (`pl-63a5400a`) é o do S3 em `us-east-1`.
-
-## Como apagar
-
-1. Termine as instâncias criadas pelo `ec2_launch.sh` ou pelo `grade_B.sh`, porque elas não fazem parte da stack.
-2. Esvazie o bucket `wsi-api-artifacts-<conta>` pelo console (S3 → Empty), porque ele é versionado. O ECR é esvaziado sozinho (`EmptyOnDelete`).
-3. Apague a stack:
-
-   ```bash
-   aws cloudformation delete-stack --region us-east-1 --stack-name wsi-module-b
-   ```
