@@ -1,6 +1,6 @@
 # Exemplo CI/CD
 
-Infraestrutura do **Módulo B (Automation)** do simulado de Cloud Computing (WorldSkills, Korea 2021 – Task 2) na AWS, região `us-east-1`, em **CloudFormation**.
+Infraestrutura de **CI/CD** de Cloud Computing na AWS, região `us-east-1`, em **CloudFormation**.
 
 Tem o CI/CD de uma API Python/Flask (CodeCommit → CodeBuild → CodeDeploy → CodePipeline, mais ECR) e as mudanças feitas depois da prova:
 
